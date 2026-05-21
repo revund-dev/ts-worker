@@ -1,0 +1,16 @@
+# Source — only the compiled dist/ ships. Devs that want source can
+# read the github repo.
+src/
+tsconfig.json
+*.tsbuildinfo
+
+# Dev artifacts
+node_modules/
+.npmrc
+.nvmrc
+CLAUDE.md
+AGENTS.md
+
+# Build noise
+.DS_Store
+*.log

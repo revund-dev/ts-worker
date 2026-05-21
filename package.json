@@ -1,0 +1,61 @@
+{
+  "name": "@revund/ts-worker",
+  "version": "0.1.0",
+  "description": "Revund's TypeScript / JavaScript AST sidecar — implements the universal revund.worker.v1.Worker gRPC contract.",
+  "license": "Apache-2.0",
+  "author": "Revund <hello@revund.dev>",
+  "homepage": "https://github.com/revund-dev/ts-worker#readme",
+  "bugs": {
+    "url": "https://github.com/revund-dev/ts-worker/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/revund-dev/ts-worker.git"
+  },
+  "keywords": [
+    "revund",
+    "ast",
+    "code-review",
+    "typescript",
+    "javascript",
+    "grpc",
+    "sidecar",
+    "ts-morph"
+  ],
+  "main": "dist/server.js",
+  "bin": {
+    "revund-ts-worker": "bin/revund-ts-worker.js"
+  },
+  "files": [
+    "bin/",
+    "dist/",
+    "proto/",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsx src/server.ts",
+    "lint": "tsc --noEmit",
+    "test": "node --test --import tsx dist/__tests__/*.test.js",
+    "vendor-proto": "mkdir -p proto/worker/v1 && cp ../../proto/worker/v1/worker.proto proto/worker/v1/worker.proto",
+    "prepublishOnly": "npm run vendor-proto && npm run build"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.12.0",
+    "@grpc/proto-loader": "^0.7.13",
+    "ts-morph": "^24.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
