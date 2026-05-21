@@ -1,6 +1,6 @@
 {
   "name": "@revund/ts-worker",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Revund's TypeScript / JavaScript AST sidecar — implements the universal revund.worker.v1.Worker gRPC contract.",
   "license": "Apache-2.0",
   "author": "Revund <hello@revund.dev>",
