@@ -1,0 +1,480 @@
+// worker.proto — the universal AST-worker contract.
+//
+// # Public API
+//
+// This file defines the wire contract every Revund AST
+// sidecar speaks. It is designed for STABILITY since the
+// contract may eventually be published as an open-source
+// interface that third-party language sidecars target.
+//
+// Compatibility rules:
+//
+//   - Adding fields to existing messages: ALLOWED (proto3
+//     ignores unknown fields gracefully).
+//   - Adding new RPCs: ALLOWED (clients negotiate capability
+//     via Describe).
+//   - Removing or renaming fields: BREAKING — bump the
+//     package version (v1 → v2). Old clients keep speaking v1.
+//   - Changing field types: BREAKING.
+//
+// # Sidecar contract
+//
+// A Revund worker is any process implementing this service.
+// It can be:
+//
+//   - A first-party reference implementation we maintain
+//     (ts-worker, php-worker, ruby-worker)
+//   - A community-built sidecar for any language
+//   - A proprietary worker a customer builds for their
+//     in-house DSL
+//
+// The bot dials the worker by host:port, calls `Describe`
+// to learn which languages + capabilities it advertises,
+// and routes Parse RPCs based on the response. The bot
+// does NOT hardcode language-to-worker mappings — every
+// worker self-identifies.
+//
+// # Minimum viable worker
+//
+// Implement only `Describe`, `Health`, and `Parse`. Set
+// `capabilities = ["parse"]`. The bot uses that worker for
+// its advertised languages and skips the rest gracefully.
+//
+// # Symbol resolution / diagnostics (optional)
+//
+// Capabilities are advisory. Workers that ALSO support
+// symbol resolution (returning declarations of identifiers
+// referenced in changed code) advertise
+// `capabilities = ["parse", "resolve_symbols"]`. Workers
+// that run language-specific type-checkers (TypeScript's
+// `tsc --noEmit`, PHP's PHPStan, Ruby's Sorbet) advertise
+// `["parse", "diagnostics"]`. The bot uses these features
+// when present, falls back to "just parse" when not.
+
+syntax = "proto3";
+
+package revund.worker.v1;
+
+option go_package = "github.com/revund-dev/revund/core/pkg/worker/proto/worker/v1;workerpb";
+
+service Worker {
+  // Describe identifies the worker. The bot calls this
+  // first to learn what languages + capabilities it
+  // supports. Idempotent, side-effect-free.
+  rpc Describe(DescribeRequest) returns (DescribeResponse);
+
+  // Health is a standard k8s-style liveness probe.
+  rpc Health(HealthRequest) returns (HealthResponse);
+
+  // Parse returns a minimal AST view (imports + decls +
+  // functions + concerns) for the requested files. Per-
+  // file parse errors are returned INSIDE the response,
+  // never as RPC errors. REQUIRED capability — every
+  // healthy worker implements this.
+  rpc Parse(ParseRequest) returns (ParseResponse);
+
+  // ResolveSymbols returns the declarations of identifiers
+  // referenced in a diff but defined elsewhere in the
+  // repo. Used by the bot's ingest layer to enrich the
+  // LLM bundle with cross-file type information.
+  //
+  // OPTIONAL capability — workers advertise
+  // "resolve_symbols" in Describe.Capabilities when
+  // implemented. Workers that don't implement it return
+  // UNIMPLEMENTED; the bot's caller checks the capability
+  // list and skips the call when unsupported.
+  rpc ResolveSymbols(ResolveRequest) returns (ResolveResponse);
+
+  // RunDiagnostics runs the language's native type-checker
+  // (tsc --noEmit for TypeScript, PHPStan for PHP, Sorbet
+  // for Ruby, etc.) and returns errors touching the
+  // changed files. Empty when the project has no errors
+  // or the worker doesn't run a type-checker — never an
+  // RPC error.
+  //
+  // OPTIONAL capability — workers advertise "diagnostics"
+  // in Describe.Capabilities when implemented.
+  rpc RunDiagnostics(DiagnosticsRequest) returns (DiagnosticsResponse);
+}
+
+// ─────────────────────────────────────────────────────────
+// Describe — self-identification
+// ─────────────────────────────────────────────────────────
+
+message DescribeRequest {}
+
+message DescribeResponse {
+  // Name is a human-readable identifier for this worker,
+  // e.g. "ts-worker", "php-worker", "ruby-worker", or a
+  // community-chosen name like "my-fancy-go-worker".
+  // Used for logging and observability; NOT used for
+  // routing (languages field does that).
+  string name = 1;
+
+  // Version is the worker's semantic version. Logged at
+  // startup and surfaced in debug bundles so we can tie
+  // findings to a specific worker build.
+  string version = 2;
+
+  // Languages the worker can parse. Lowercase canonical
+  // names matching the lang.Language enum on the Go side:
+  // "typescript", "javascript", "go", "php", "ruby",
+  // "python", "rust", "java", "kotlin", "swift", "csharp".
+  //
+  // A worker MAY advertise multiple languages (a tree-
+  // sitter-based worker might handle ten). The bot routes
+  // each language's files to the worker that advertises
+  // it; on conflict (multiple workers advertise the same
+  // language), the bot picks the first one registered.
+  repeated string languages = 3;
+
+  // Capabilities is the set of optional features this
+  // worker implements beyond the required Parse RPC.
+  // Known values:
+  //
+  //   "parse"            — Parse RPC (REQUIRED; always
+  //                        present in a healthy worker)
+  //   "resolve_symbols"  — symbol-decl resolution; the
+  //                        worker can return declarations
+  //                        of identifiers referenced in
+  //                        changed code.
+  //   "diagnostics"      — language-specific type-check
+  //                        diagnostics (tsc, PHPStan,
+  //                        Sorbet, etc.).
+  //   "self_fetch"       — worker can clone the repo
+  //                        itself given a RepoSource
+  //                        (url + ref + auth_token) on
+  //                        the request. Required for
+  //                        cross-host deployments where
+  //                        the bot and worker do NOT
+  //                        share a filesystem. When this
+  //                        capability is advertised, the
+  //                        bot sends `repo_source`
+  //                        instead of `repo_path` on
+  //                        Parse / ResolveSymbols /
+  //                        RunDiagnostics RPCs.
+  //
+  // New capabilities can be added without breaking older
+  // bots — they advertise but the bot ignores capabilities
+  // it doesn't recognize.
+  repeated string capabilities = 4;
+}
+
+// RepoSource tells a self-fetching worker how to obtain
+// the repo without depending on a shared filesystem with
+// the bot. The worker shallow-clones via git using these
+// values, caches the clone for the review's other RPCs,
+// and evicts on idle.
+//
+// Capability gate: workers MUST advertise "self_fetch"
+// in Describe.Capabilities before the bot will send
+// `repo_source`. Workers without that capability ignore
+// the field entirely and use `repo_path`.
+//
+// # Security expectations on workers
+//
+//   - Use auth_token ONLY at clone time (as the password
+//     in https://x-access-token:<TOKEN>@host/path.git).
+//   - Immediately after a successful clone, strip the
+//     token from the remote URL stored in .git/config.
+//   - Never log the token. Sanitize error messages that
+//     might include the URL.
+//   - Never persist the token to disk in any form.
+//
+// Tokens are short-lived (typically 1 hour for GitHub
+// installation tokens) and scoped to the source repo's
+// permissions, so blast radius is bounded — but the
+// hygiene rules above still apply.
+message RepoSource {
+  // url is the https clone URL, e.g.
+  // "https://github.com/owner/repo.git" — no userinfo.
+  // SSH URLs are not supported here — the bot's auth
+  // model is bearer-token-over-https.
+  string url = 1;
+
+  // ref is the commit SHA (preferred) or branch / tag
+  // name to check out. Commit SHA is deterministic and
+  // matches what GitHub / GitLab webhooks already give
+  // us; branch/tag names are accepted for the local-dev
+  // case but workers should warn when they receive one
+  // (drift risk).
+  string ref = 2;
+
+  // auth_token is the bearer credential the worker uses
+  // as the password in the clone URL. Typically a
+  // platform installation access token (1h TTL).
+  string auth_token = 3;
+
+  // auth_user is the basic-auth username the worker
+  // pairs with auth_token to compose the clone URL:
+  //
+  //   https://<auth_user>:<auth_token>@<host>/<path>
+  //
+  // Defaults to "x-access-token" when empty — that's
+  // GitHub's convention and works for the majority of
+  // first-party deployments. Other platforms set this
+  // explicitly:
+  //
+  //   GitHub     → "x-access-token" (or empty)
+  //   GitLab     → "oauth2"
+  //   Bitbucket  → "x-token-auth"
+  //
+  // Adding a new platform = the bot sets a new
+  // auth_user string; workers don't need to know which
+  // platform they're talking to.
+  string auth_user = 4;
+}
+
+message HealthRequest {}
+message HealthResponse {
+  string version = 1;
+}
+
+// ─────────────────────────────────────────────────────────
+// Parse — the core AST RPC
+// ─────────────────────────────────────────────────────────
+
+message ParseRequest {
+  // Absolute path to the repo root. The worker resolves
+  // file paths relative to this root.
+  //
+  // Exactly one of repo_path / repo_source is populated
+  // per request. repo_path is set when the bot and
+  // worker share a filesystem (CLI / local sidecar /
+  // pod-with-shared-volume). repo_source is set when
+  // the worker advertises "self_fetch" and the bot is
+  // dialing across the network.
+  string repo_path = 1;
+
+  // Repo-relative paths to parse. Slash-normalized,
+  // forward-slash separator regardless of platform.
+  repeated string files = 2;
+
+  // Self-fetch source — populated when the bot wants
+  // the worker to clone the repo itself. See RepoSource
+  // for the capability gate and security expectations.
+  RepoSource repo_source = 3;
+}
+
+message ParseResponse {
+  repeated ParsedFile files = 1;
+}
+
+// ParsedFile carries the minimal AST surface every
+// structural detector consumes. Shape is universal across
+// languages — implementations populate the fields their
+// language meaningfully exposes and leave the rest empty.
+message ParsedFile {
+  // Repo-relative path, slash-normalized. Echoed back from
+  // the request so the bot can correlate response files
+  // with request files without ordering assumptions.
+  string path = 1;
+
+  // The language tag the worker assigned to this file.
+  // Usually matches one of the languages from the worker's
+  // Describe response. Set even on parse errors.
+  string language = 2;
+
+  repeated ImportRef imports = 3;
+  repeated DeclRef decls = 4;
+  repeated FunctionRef functions = 5;
+  repeated ConcernEvidenceRef concerns = 7;
+
+  // Non-empty when the worker failed to parse this file
+  // cleanly. The other fields may still carry partial
+  // results — workers should return whatever the parser
+  // salvaged so detectors get USEFUL signal even on
+  // syntactically-broken files.
+  string parse_error = 6;
+}
+
+// ImportRef is one import / require / use declaration.
+message ImportRef {
+  // Raw module identifier as written in source. The bot
+  // does NOT resolve this against the language's module
+  // system; that's the worker's job if it advertises
+  // resolve_symbols.
+  string path = 1;
+
+  // Local binding when the language allows renaming on
+  // import (Go: `import f "fmt"`, JS: `import { x as y }`,
+  // PHP: `use Foo\Bar as B`, Ruby: autoload). Empty when
+  // not applicable or not aliased.
+  string alias = 2;
+
+  // 1-based line number in the source file.
+  int32 line = 3;
+}
+
+// DeclRef is one top-level declaration. Kind is a lowercase
+// string from the canonical set: function | method | type |
+// interface | const | var | class | trait | enum | module |
+// constant | component | hook. Workers MAY advertise
+// kinds not in this list; the bot's structural detectors
+// switch on the canonical set and silently ignore unknowns
+// (forward-compat).
+message DeclRef {
+  string name = 1;
+  string kind = 2;
+  int32 line = 3;
+  int32 end_line = 4;
+
+  // Exported is whether this declaration is visible
+  // outside its compilation unit / module / namespace.
+  // Languages without formal export concepts (PHP, Ruby)
+  // set this to true for top-level decls.
+  bool exported = 5;
+}
+
+// FunctionRef describes one function / method definition.
+// Carries the data the structural detectors need for
+// god-function, complexity, and the three DRY variants.
+message FunctionRef {
+  string name = 1;
+  int32 start_line = 2;
+  int32 end_line = 3;
+
+  // Cyclomatic complexity estimate (McCabe — count of
+  // decision points + 1). Workers may compute it however
+  // they prefer; the bot uses the value as a coarse
+  // signal, not a precise measurement.
+  int32 complexity = 4;
+
+  bool is_method = 5;
+  bool is_exported = 6;
+
+  // Hash is the LANGUAGE-SPECIFIC fingerprint of the
+  // function body's AST shape. Two functions in the same
+  // language with the same hash share structure modulo
+  // identifier names + literal values. Empty when the
+  // body was too small to be a meaningful DRY signal.
+  //
+  // The hashing scheme is per-worker. Recommended: SHA-1
+  // of a token stream, truncated to 16 hex chars. The
+  // ts-worker reference implementation in
+  // workers/ts/src/parser.ts is the template for new
+  // workers.
+  string hash = 7;
+
+  // CanonicalHash is the LANGUAGE-NEUTRAL fingerprint
+  // produced by mapping the function body's AST onto a
+  // shared canonical token vocabulary. Two functions in
+  // DIFFERENT languages with the same canonical hash share
+  // a structural shape — the basis for cross-language
+  // duplicate detection.
+  //
+  // The canonical vocabulary is defined in
+  // core/pkg/structural/lang/canonical.go. New workers
+  // mirror that vocabulary; PR-able if a new construct
+  // needs adding.
+  string canonical_hash = 8;
+
+  repeated BlockRef blocks = 9;
+}
+
+// BlockRef is one nested statement block (if-body, else-
+// body, for-body, switch-case body, try / catch / finally
+// body). Each block carries both hash variants so within-
+// language and cross-language block-duplicate detection
+// consume the same data.
+message BlockRef {
+  // Kind of the construct that owns this block:
+  // "if" | "else" | "elseif" | "for" | "case" |
+  // "try" | "catch" | "finally" | "rescue" | "block".
+  string kind = 1;
+
+  int32 start_line = 2;
+  int32 end_line = 3;
+  string hash = 4;             // language-specific
+  string canonical_hash = 5;   // language-neutral
+}
+
+// ConcernEvidenceRef is one categorized signal the worker
+// extracted. The bot demuxes by category into the typed
+// ConcernSet on lang.FileView.
+//
+// Canonical category values:
+//   "presentation"  — UI rendering / templates / JSX
+//   "state"         — in-memory state, hooks, signals
+//   "transport"     — server-side request handlers
+//   "network"       — outbound HTTP / RPC / message-broker
+//   "dataaccess"    — persistent storage operations
+//   "io"            — filesystem, OS-level IO
+//   "config"        — env reads, flags, dotenv
+//   "business"      — high-complexity decision logic
+//
+// New categories can be added by workers; the bot
+// silently drops unknown values so older bots keep working.
+message ConcernEvidenceRef {
+  string category = 1;
+  int32 line = 2;
+  string symbol = 3;
+  string note = 4;
+}
+
+// ─────────────────────────────────────────────────────────
+// ResolveSymbols — optional capability
+// ─────────────────────────────────────────────────────────
+
+message ResolveRequest {
+  // Absolute repo root path. See ParseRequest.repo_path
+  // for the repo_path / repo_source contract.
+  string repo_path = 1;
+
+  // The unified diff being reviewed. The worker extracts
+  // referenced-but-undeclared identifiers from the diff
+  // and looks up their declarations.
+  string diff = 2;
+
+  // Repo-relative paths of changed files. Authoritative
+  // when present; the worker may also derive its own list
+  // from the diff.
+  repeated string changed_files = 3;
+
+  // Self-fetch source — set when the worker should clone
+  // the repo itself instead of reading from repo_path.
+  RepoSource repo_source = 4;
+}
+
+message ResolveResponse {
+  repeated SymbolDecl symbols = 1;
+}
+
+message SymbolDecl {
+  string name = 1;
+  string file_path = 2;  // repo-relative
+  int32 start_line = 3;
+  int32 end_line = 4;
+  string text = 5;       // full declaration source
+}
+
+// ─────────────────────────────────────────────────────────
+// RunDiagnostics — optional capability
+// ─────────────────────────────────────────────────────────
+
+message DiagnosticsRequest {
+  // See ParseRequest.repo_path for the repo_path /
+  // repo_source contract.
+  string repo_path = 1;
+
+  // Only return diagnostics whose file is in this set.
+  // Empty = no filter (return everything tsc / PHPStan /
+  // Sorbet found).
+  repeated string filter_files = 2;
+
+  // Self-fetch source — set when the worker should clone
+  // the repo itself instead of reading from repo_path.
+  RepoSource repo_source = 3;
+}
+
+message DiagnosticsResponse {
+  repeated Diagnostic diagnostics = 1;
+}
+
+message Diagnostic {
+  string file = 1;       // repo-relative
+  int32 line = 2;
+  int32 col = 3;
+  string code = 4;       // e.g. "TS2345", "PHPStan.Error", "Sorbet:7008"
+  string message = 5;
+}
