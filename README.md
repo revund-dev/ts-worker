@@ -52,9 +52,9 @@ The worker advertises three capabilities via the `Describe` RPC:
 ## Contract
 
 The wire contract is defined in
-[`proto/worker/v1/worker.proto`](./proto/worker/v1/worker.proto), vendored
-inside the package. The canonical source lives at
-[`revund-dev/revund-workers/proto/worker/v1/worker.proto`](https://github.com/revund-dev/revund-workers/blob/main/proto/worker/v1/worker.proto).
+[`proto/worker/v1/worker.proto`](./proto/worker/v1/worker.proto),
+vendored inside the package and loaded at startup by
+[`@grpc/proto-loader`](https://github.com/grpc/grpc-node/tree/master/packages/proto-loader).
 
 ## License
 
