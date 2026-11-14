@@ -30,13 +30,14 @@ import * as protoLoader from "@grpc/proto-loader";
 
 import { resolveSymbols } from "./resolver";
 import { runDiagnostics } from "./diagnostics";
+import { verifySuggestion } from "./verify";
 import { parseFiles } from "./parser";
 import { fetchOrCache, type RepoSource } from "./fetcher";
 
 const VERSION = "0.1.0";
 const NAME = "ts-worker";
 const LANGUAGES = ["typescript", "javascript"];
-const CAPABILITIES = ["parse", "resolve_symbols", "diagnostics", "self_fetch"];
+const CAPABILITIES = ["parse", "resolve_symbols", "diagnostics", "verify_suggestion", "self_fetch"];
 const DEFAULT_PORT = 50051;
 
 // ─────────────────────────────────────────────────────────
@@ -107,6 +108,19 @@ interface Diagnostic {
 }
 interface DiagnosticsResponse {
   diagnostics: Diagnostic[];
+}
+
+interface VerifySuggestionRequest {
+  repo_path: string;
+  file: string;
+  original_content: string;
+  patched_content: string;
+  repo_source?: RepoSourceMsg;
+}
+interface VerifySuggestionResponse {
+  verified: boolean;
+  ok: boolean;
+  new_diagnostics: Diagnostic[];
 }
 
 type Cb<R> = grpc.sendUnaryData<R>;
@@ -323,6 +337,35 @@ function main(): void {
         });
       } catch (err) {
         cb(rpcError(err, "DiagnosticsError"));
+      }
+    },
+    VerifySuggestion: async (
+      call: grpc.ServerUnaryCall<VerifySuggestionRequest, VerifySuggestionResponse>,
+      cb: Cb<VerifySuggestionResponse>,
+    ) => {
+      const denied = authorized(call);
+      if (denied) { cb(denied); return; }
+      try {
+        const repoPath = resolveRepoPath(call.request.repo_path, call.request.repo_source);
+        const result = await verifySuggestion({
+          repoPath,
+          file: call.request.file,
+          originalContent: call.request.original_content,
+          patchedContent: call.request.patched_content,
+        });
+        cb(null, {
+          verified: result.verified,
+          ok: result.ok,
+          new_diagnostics: result.newDiagnostics.map((d) => ({
+            file: d.file,
+            line: d.line,
+            col: d.col,
+            code: d.code,
+            message: d.message,
+          })),
+        });
+      } catch (err) {
+        cb(rpcError(err, "VerifySuggestionError"));
       }
     },
   });
