@@ -15,8 +15,8 @@
 // "Best effort" by design: missing tsconfig, unresolvable identifiers, and
 // stdlib refs are silently skipped — partial resolution is valid.
 
-import { resolve, relative, isAbsolute } from "node:path";
-import { existsSync } from "node:fs";
+import { resolve, relative } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
 import {
   Node,
   SourceFile,
@@ -25,6 +25,7 @@ import {
 
 import { getProject } from "./utils/project";
 import { changedFilesFromDiff, referencedIdentifiers } from "./utils/diff";
+import { makeJail } from "./utils/jail";
 
 export interface SymbolDecl {
   name: string;
@@ -124,11 +125,17 @@ function findDeclaration(
   id: string,
 ): SymbolDecl | null {
   const changedAbs = new Set(changedFiles.map((f) => resolve(repoPath, f)));
+  // Only declarations whose realpath is inside the repo. The project can
+  // pull in `../` imports, absolute includes and symlinked files — in the
+  // self-fetch cache that means another tenant's checkout.
+  const root = realpathSync(repoPath);
+  const inside = makeJail(root);
 
   for (const sf of project.getSourceFiles()) {
     const filePath = sf.getFilePath();
     if (changedAbs.has(filePath)) continue;
     if (filePath.includes("/node_modules/")) continue;
+    if (!inside(filePath)) continue;
 
     const decl =
       findNamed(sf, id, SyntaxKind.FunctionDeclaration) ??
@@ -147,8 +154,7 @@ function findDeclaration(
       text = text.slice(0, MAX_DECL_TEXT) + "\n// … truncated";
     }
 
-    let rel = isAbsolute(filePath) ? relative(repoPath, filePath) : filePath;
-    if (rel.startsWith("../")) rel = filePath; // outside the repo — leave absolute
+    const rel = relative(root, realpathSync(filePath));
 
     return {
       name: id,

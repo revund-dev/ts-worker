@@ -6,7 +6,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { runDiagnostics } from "../diagnostics";
@@ -116,6 +116,41 @@ test("drops diagnostics for files outside the repo", async () => {
     diags.every((d) => !d.file.includes("host.ts")),
     `out-of-repo file leaked: ${JSON.stringify(diags)}`,
   );
+});
+
+test("standard lib resolves — no false positives on valid code", async () => {
+  const fx = fixture();
+  write(join(fx.repo, "src", "ok.ts"), 'export const s = [1, 2].map((n) => n.toFixed(1)).join(",");\n');
+  const diags = await runDiagnostics({ repoPath: fx.repo, filterFiles: ["src/ok.ts"] });
+  assert.deepEqual(diags, []);
+});
+
+// Self-fetch clones of different tenants sit side by side in one cache dir.
+// A PR must not be able to type-check against a neighbour's source: the
+// "did you mean …" hints alone would leak their symbol names.
+test("cannot read a sibling checkout via relative import", async () => {
+  const fx = fixture();
+  const sibling = join(dirname(fx.repo), "other-tenant");
+  write(join(sibling, "src", "secret.ts"), "export const OTHER_TENANT_SECRET_NAME = 1;\n");
+  write(join(fx.repo, "src", "peek.ts"), 'import { OTHER_TENANT_SECRET_NAMX } from "../../other-tenant/src/secret";\nexport { OTHER_TENANT_SECRET_NAMX };\n');
+
+  const diags = await runDiagnostics({ repoPath: fx.repo, filterFiles: ["src/peek.ts"] });
+
+  assert.ok(diags.some((d) => d.code === "TS2307"), `expected unresolved module, got ${JSON.stringify(diags)}`);
+  assert.ok(diags.every((d) => !d.message.includes("OTHER_TENANT_SECRET_NAME")), `sibling symbol leaked: ${JSON.stringify(diags)}`);
+});
+
+test("cannot read host files through a committed symlink", async () => {
+  const fx = fixture();
+  const outside = mkdtempSync(join(tmpdir(), "revund-rev17-host-"));
+  write(join(outside, "host.ts"), "export const HOST_SECRET_NAME = 1;\n");
+  symlinkSync(join(outside, "host.ts"), join(fx.repo, "src", "leak.ts"));
+  write(join(fx.repo, "src", "peek.ts"), 'import { HOST_SECRET_NAMX } from "./leak";\nexport { HOST_SECRET_NAMX };\n');
+
+  const diags = await runDiagnostics({ repoPath: fx.repo, filterFiles: [] });
+
+  assertFoundTypeError(diags);
+  assert.ok(diags.every((d) => !d.message.includes("HOST_SECRET_NAME")), `host symbol leaked: ${JSON.stringify(diags)}`);
 });
 
 test("no tsconfig in the repo root → empty, no parent-dir lookup", async () => {

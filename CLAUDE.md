@@ -52,6 +52,7 @@ workers/ts/
 │   ├── tsc-runner.ts        # child process: bundled TS compiler API, no repo code
 │   └── utils/
 │       ├── diff.ts          # extracts referenced identifiers from diff text
+│       ├── jail.ts          # realpath-inside-repo predicate for every read
 │       ├── project.ts       # ts-morph Project factory, caches per repo path
 │       └── sandbox.ts       # scrubbed env + hardened git args for subprocesses
 ├── package.json
@@ -67,7 +68,8 @@ Override with `REVUND_WORKER_PROTO` for non-standard container layouts.
 1. Parse diff text to extract identifiers referenced but not declared in changed hunks
 2. Load the repo's `tsconfig.json` via `ts-morph` Project
 3. For each unresolved identifier, find its declaration node in the project
-4. Return the declaration source text, file path, and line range
+4. Return the declaration source text, file path, and line range — only for files whose
+   realpath is inside the repo (`utils/jail.ts`; self-fetch clones share a cache dir)
 
 Cache the `ts-morph` Project instance per repo path — project initialization is expensive.
 Invalidate cache when `tsconfig.json` mtime changes.
@@ -91,7 +93,9 @@ No `<repo>/node_modules/.bin/tsc`, no `npx`, no tsc from PATH.
    cwd outside the repo; killed after 30s
 2. The runner type-checks with the TypeScript bundled in ts-morph (our own dependency)
    via the compiler API — only `<repo>/tsconfig.json`, `plugins` stripped, emit and
-   build info off, root files outside the repo dropped
+   build info off. A jailed `CompilerHost` refuses any read whose realpath is outside
+   the repo (`../` imports, `extends`, symlinks, sibling tenant clones in the cache)
+   and serves the standard lib from ts-morph's in-memory copy
 3. Results come back over IPC; filter to files changed in the diff, cap at 200
 4. Return structured `TscDiagnostic[]`
 
