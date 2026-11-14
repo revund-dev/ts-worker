@@ -48,10 +48,12 @@ workers/ts/
 │   ├── server.ts            # gRPC server entrypoint (Describe/Health/Parse/Resolve/Diagnostics)
 │   ├── parser.ts            # ts-morph → universal ParsedFile shape
 │   ├── resolver.ts          # symbol resolution via ts-morph
-│   ├── diagnostics.ts       # tsc --noEmit runner, output parser
+│   ├── diagnostics.ts       # forks tsc-runner, filters diagnostics to changed files
+│   ├── tsc-runner.ts        # child process: bundled TS compiler API, no repo code
 │   └── utils/
 │       ├── diff.ts          # extracts referenced identifiers from diff text
-│       └── project.ts       # ts-morph Project factory, caches per repo path
+│       ├── project.ts       # ts-morph Project factory, caches per repo path
+│       └── sandbox.ts       # scrubbed env + hardened git args for subprocesses
 ├── package.json
 └── tsconfig.json
 ```
@@ -82,10 +84,19 @@ interface SymbolDecl {
 
 ## Diagnostics approach
 
-1. Spawn `tsc --noEmit --pretty false` as a child process in the repo directory
-2. Parse stdout line by line — format: `file(line,col): error TSxxxx: message`
-3. Filter to only diagnostics touching files changed in the diff
+**Never execute code from the reviewed repo** (REV-17, see `/docs/threat-model.md`).
+No `<repo>/node_modules/.bin/tsc`, no `npx`, no tsc from PATH.
+
+1. `diagnostics.ts` forks `tsc-runner.js` with a scrubbed env (`utils/sandbox.ts`) and
+   cwd outside the repo; killed after 30s
+2. The runner type-checks with the TypeScript bundled in ts-morph (our own dependency)
+   via the compiler API — only `<repo>/tsconfig.json`, `plugins` stripped, emit and
+   build info off, root files outside the repo dropped
+3. Results come back over IPC; filter to files changed in the diff, cap at 200
 4. Return structured `TscDiagnostic[]`
+
+Every `git` call in `fetcher.ts` goes through `hardenedGitArgs` + `gitEnv`: hooks,
+fsmonitor and system/global git config off, allow-listed env.
 
 ```typescript
 interface TscDiagnostic {
@@ -103,14 +114,14 @@ Listens on `0.0.0.0:50051` by default, overridable via `TS_WORKER_PORT`.
 Implements the five RPCs defined in `/proto/worker/v1/worker.proto`
 (`revund.worker.v1.Worker` service).
 
-On startup: verify Node version, verify tsc is available in PATH, then start server.
+On startup: verify Node version, then start server. tsc is never looked up on PATH.
 First stdout line after a successful bind is `ready: <addr>` — when running as a
 spawned sidecar, the parent process greps for that to know when to start sending
 requests.
 
 ## Error handling
 
-- If tsc is not found, `RunDiagnostics` returns empty array with a warning — never error
+- If the tsc runner fails or times out, `RunDiagnostics` returns empty array — never error
 - If a symbol cannot be resolved, skip it silently — partial resolution is valid
 - If the ts-morph Project fails to load (bad tsconfig), return error so core can fall back
 - Never crash the server on a single bad request — catch all errors per-request

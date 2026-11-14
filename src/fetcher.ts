@@ -34,6 +34,7 @@ import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { gitEnv, hardenedGitArgs } from "./utils/sandbox";
 
 export interface RepoSource {
   url: string;
@@ -171,7 +172,9 @@ function injectToken(cloneURL: string, token: string, user?: string): string {
 function run(bin: string, args: string[]): void {
   let res: SpawnSyncReturns<Buffer>;
   try {
-    res = spawnSync(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+    // Every git call runs hardened (hooks/fsmonitor/host config off) with
+    // a scrubbed env: the checkout is attacker-controlled. See utils/sandbox.
+    res = spawnSync(bin, hardenedGitArgs(args), { stdio: ["ignore", "pipe", "pipe"], env: gitEnv() });
   } catch (err) {
     throw new Error(`fetcher: ${bin} spawn failed: ${err instanceof Error ? err.message : String(err)}`);
   }

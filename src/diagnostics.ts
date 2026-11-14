@@ -1,17 +1,26 @@
-// `tsc --noEmit` driver. Spawns the project's tsc, parses output, returns
-// structured diagnostics filtered to the changed files.
+// Type-check driver. Runs the worker's bundled TypeScript against the
+// repo and returns structured diagnostics filtered to the changed files.
 //
-// Resolution order for the tsc binary, picking the first that exists:
-//   1. <repoPath>/node_modules/.bin/tsc — the project's pinned version, ideal.
-//   2. `npx tsc` — works without an explicit install but adds latency.
+// SECURITY (REV-17): this never executes anything from the reviewed repo.
+// The old driver ran `<repo>/node_modules/.bin/tsc` — a file any PR author
+// can commit — and otherwise `npx --yes tsc`, which downloads and runs
+// whatever npm calls `tsc`. Now:
 //
-// Per the contract, this NEVER returns an RPC error. If tsc isn't found or
-// crashes, we return an empty array. The pass simply has no diagnostics to
-// reason about — degraded mode, but the review still ships.
+//   - the compiler is the `typescript` bundled inside ts-morph (a worker
+//     dependency), driven through the compiler API in tsc-runner.ts
+//   - the runner is forked with a scrubbed env (no worker secret, no
+//     NODE_OPTIONS) and cwd outside the repo, killed after TSC_TIMEOUT_MS
+//   - tsconfig plugins, emit and build info are stripped in the runner
+//
+// Per the contract, this NEVER returns an RPC error. If the runner fails
+// or times out we return an empty array — degraded mode, review still ships.
 
-import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { join, relative, isAbsolute, resolve } from "node:path";
+import { fork } from "node:child_process";
+import { existsSync, realpathSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { extname, join, relative, isAbsolute, resolve } from "node:path";
+import type { RawDiagnostic } from "./tsc-runner";
+import { scrubbedEnv } from "./utils/sandbox";
 
 export interface TscDiagnostic {
   file: string;
@@ -36,92 +45,62 @@ const TSC_TIMEOUT_MS = 30_000;
 export async function runDiagnostics(args: DiagnosticsArgs): Promise<TscDiagnostic[]> {
   if (!args.repoPath || !existsSync(args.repoPath)) return [];
 
-  const tscBin = join(args.repoPath, "node_modules", ".bin", "tsc");
-  let cmd: string;
-  let cmdArgs: string[];
-  if (existsSync(tscBin)) {
-    cmd = tscBin;
-    cmdArgs = ["--noEmit", "--pretty", "false"];
-  } else {
-    cmd = "npx";
-    cmdArgs = ["--yes", "tsc", "--noEmit", "--pretty", "false"];
-  }
-
-  const stdout = await runOnce(cmd, cmdArgs, args.repoPath);
-  if (stdout === null) return [];
+  // The runner reports realpaths (macOS /var → /private/var, symlinked
+  // cache dirs); normalise against the same root.
+  const root = realpathSync(args.repoPath);
+  const raw = await runChecker(root);
+  if (raw === null) return [];
 
   const filterSet = new Set(args.filterFiles.map((f) => normalize(args.repoPath, f)));
   const out: TscDiagnostic[] = [];
-  for (const line of stdout.split("\n")) {
-    const d = parseTscLine(line, args.repoPath);
-    if (!d) continue;
-    if (filterSet.size > 0 && !filterSet.has(d.file)) continue;
-    out.push(d);
+  for (const d of raw) {
+    const file = normalize(root, d.file);
+    if (isAbsolute(file) || file.startsWith("..")) continue; // outside the repo
+    if (filterSet.size > 0 && !filterSet.has(file)) continue;
+    out.push({ ...d, file });
     if (out.length >= MAX_DIAGNOSTICS) break;
   }
   return out;
 }
 
-// runOnce returns the merged stdout/stderr of the command, or null on any
-// failure short of an actual diagnostic-bearing exit. tsc exits non-zero
-// when it finds errors — that's a SUCCESS for our purposes — so we treat
-// non-zero as "we got output worth parsing."
-async function runOnce(cmd: string, args: string[], cwd: string): Promise<string | null> {
+// runChecker forks tsc-runner (same extension as this module, so dev mode
+// under tsx keeps working) and waits for its single IPC reply. Returns null on crash, timeout or runner error.
+function runChecker(repoPath: string): Promise<RawDiagnostic[] | null> {
+  const runner = join(__dirname, `tsc-runner${extname(__filename)}`);
   return new Promise((resolveP) => {
-    const child = spawn(cmd, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
     let settled = false;
-
+    const done = (v: RawDiagnostic[] | null): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolveP(v);
+    };
+    let child: ReturnType<typeof fork>;
+    try {
+      child = fork(runner, [repoPath], {
+        cwd: tmpdir(),
+        env: scrubbedEnv(),
+        // Compiled .js needs no loader; only dev mode (.ts under tsx)
+        // inherits execArgv. Inheriting bare `--import x` flags would also
+        // break, since they resolve against the child's cwd.
+        execArgv: extname(runner) === ".ts" ? process.execArgv : [],
+        stdio: ["ignore", "ignore", "pipe", "ipc"],
+      });
+    } catch {
+      resolveP(null);
+      return;
+    }
     const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
       child.kill("SIGKILL");
-      resolveP(null);
+      done(null);
     }, TSC_TIMEOUT_MS);
-
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
+    child.stderr?.resume();
+    child.on("message", (msg: { ok: boolean; diagnostics?: RawDiagnostic[] }) => {
+      done(msg.ok && Array.isArray(msg.diagnostics) ? msg.diagnostics : null);
     });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
-    child.on("error", () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolveP(null);
-    });
-    child.on("close", () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      // tsc writes diagnostics to stdout, occasionally also stderr. Merge.
-      resolveP(stdout + stderr);
-    });
+    child.on("error", () => done(null));
+    child.on("exit", () => done(null));
   });
-}
-
-// parseTscLine handles the standard tsc --pretty=false format:
-//   src/foo.ts(12,5): error TS2345: message text
-// Returns null on lines that aren't diagnostics (summary "Found N errors", etc.)
-function parseTscLine(line: string, repoPath: string): TscDiagnostic | null {
-  const re = /^(.+?)\((\d+),(\d+)\):\s+(?:error|warning)\s+(TS\d+):\s+(.+)$/;
-  const m = re.exec(line);
-  if (!m) return null;
-  const [, file, lineStr, colStr, code, message] = m;
-  const lineNum = Number(lineStr);
-  const colNum = Number(colStr);
-  if (!Number.isFinite(lineNum) || !Number.isFinite(colNum) || !file || !code || !message) {
-    return null;
-  }
-  return {
-    file: normalize(repoPath, file),
-    line: lineNum,
-    col: colNum,
-    code,
-    message,
-  };
 }
 
 function normalize(repoPath: string, file: string): string {
